@@ -903,7 +903,9 @@ let indexes = {numbers:0, vowels:0, colors:0, animals:0, shapes:0};
 let audioCtx = null;
 
 function getAudioCtx() {
-  if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  // iOS puede suspender el contexto en cualquier momento — siempre resumir
+  if (audioCtx.state === 'suspended') audioCtx.resume();
   return audioCtx;
 }
 
@@ -1267,49 +1269,64 @@ function playTapChime(sec) {
 function playCelebrate() {
   try {
     const ctx = getAudioCtx();
+    const now = ctx.currentTime;
 
-    // Melodía principal: escala pentatónica ascendente con acento final
+    // Melodía principal: escala pentatónica ascendente
     const melody = [
       {f:523, t:0.00, d:0.30, v:0.16},
       {f:587, t:0.14, d:0.28, v:0.15},
       {f:659, t:0.26, d:0.28, v:0.15},
       {f:784, t:0.38, d:0.28, v:0.16},
-      {f:880, t:0.50, d:0.50, v:0.18},  // nota de llegada
-      {f:1047,t:0.65, d:0.65, v:0.17},  // coronación
+      {f:880, t:0.50, d:0.50, v:0.18},
+      {f:1047,t:0.65, d:0.65, v:0.17},
     ];
     melody.forEach(({f,t,d,v}) => playWarmNote(f, t, d, v));
 
-    // Arpegio de acorde final (Do mayor) — brilla arriba
-    setTimeout(() => {
-      [1047,1319,1568,2093].forEach((f,i) =>
-        playNote(f, i*0.06, 0.45, 0.09, 'sine')
-      );
-    }, 800);
+    // Arpegio brillante — todo pre-agendado desde now, sin setTimeout
+    [1047,1319,1568,2093].forEach((f,i) => {
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(getMaster());
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      const t2 = now + 0.8 + i * 0.06;
+      gain.gain.setValueAtTime(0,    t2);
+      gain.gain.linearRampToValueAtTime(0.09, t2 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t2 + 0.45);
+      osc.start(t2); osc.stop(t2 + 0.5);
+    });
 
-    // Campanitas que bajan suavemente después
-    setTimeout(() => {
-      [1568,1319,1047,784,659].forEach((f,i) =>
-        playWarmNote(f, i*0.10, 0.4, 0.07)
-      );
-    }, 1200);
+    // Campanitas descendentes — también pre-agendadas
+    [1568,1319,1047,784,659].forEach((f,i) => {
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(getMaster());
+      osc.type = 'triangle';
+      osc.frequency.value = f;
+      const t3 = now + 1.2 + i * 0.10;
+      gain.gain.setValueAtTime(0,    t3);
+      gain.gain.linearRampToValueAtTime(0.07, t3 + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.001, t3 + 0.4);
+      osc.start(t3); osc.stop(t3 + 0.45);
+    });
 
-    // Pulso de "aplauso" — ruido blanco breve x3
-    for (let k=0; k<3; k++) {
-      setTimeout(() => {
-        try {
-          const buf  = ctx.createBuffer(1, ctx.sampleRate*0.08, ctx.sampleRate);
-          const data = buf.getChannelData(0);
-          for (let i=0;i<data.length;i++) data[i]=(Math.random()*2-1)*0.15;
-          const src  = ctx.createBufferSource();
-          const g    = ctx.createGain();
-          const f    = ctx.createBiquadFilter();
-          f.type='bandpass'; f.frequency.value=2000; f.Q.value=0.5;
-          src.buffer=buf; src.connect(f); f.connect(g); g.connect(getMaster());
-          g.gain.setValueAtTime(0.18, ctx.currentTime);
-          g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.08);
-          src.start(); src.stop(ctx.currentTime+0.1);
-        } catch(e){}
-      }, k*120);
+    // Pulsos de "aplauso" — ruido blanco breve x3, pre-agendados
+    for (let k = 0; k < 3; k++) {
+      try {
+        const tK   = now + k * 0.12;
+        const buf  = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.08), ctx.sampleRate);
+        const data = buf.getChannelData(0);
+        for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * 0.15;
+        const src = ctx.createBufferSource();
+        const g   = ctx.createGain();
+        const flt = ctx.createBiquadFilter();
+        flt.type = 'bandpass'; flt.frequency.value = 2000; flt.Q.value = 0.5;
+        src.buffer = buf;
+        src.connect(flt); flt.connect(g); g.connect(getMaster());
+        g.gain.setValueAtTime(0.18, tK);
+        g.gain.exponentialRampToValueAtTime(0.001, tK + 0.08);
+        src.start(tK); src.stop(tK + 0.1);
+      } catch(e){}
     }
 
   } catch(e){}
@@ -1404,14 +1421,33 @@ function stopBgMusic() {
 }
 
 // La música arranca con el primer toque del usuario (política del navegador)
+// iOS requiere: 1) crear AudioContext dentro del gesto, 2) llamar resume() sincrónicamente
 let musicStarted = false;
+
 function ensureMusicStarted() {
-  if (!musicStarted) { musicStarted = true; startBgMusic(); }
+  // Crear contexto si no existe — debe hacerse dentro del evento táctil
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  // iOS Safari deja el contexto en "suspended" — hay que resumirlo explícitamente
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+  if (!musicStarted) {
+    musicStarted = true;
+    // Pequeño delay para que resume() termine antes de crear osciladores
+    setTimeout(() => startBgMusic(), 80);
+  }
 }
 
-/* ── Enganchar música al primer toque ── */
-document.addEventListener('click',     ensureMusicStarted, {once:true});
-document.addEventListener('touchstart',ensureMusicStarted, {once:true, passive:true});
+/* ── Enganchar música al primer toque — captura en fase capture para iOS ── */
+document.addEventListener('touchstart', ensureMusicStarted, { once: true, passive: true, capture: true });
+document.addEventListener('click',      ensureMusicStarted, { once: true, capture: true });
+
+/* ── Resumir AudioContext en CADA toque (iOS lo suspende automáticamente) ── */
+document.addEventListener('touchstart', () => {
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}, { passive: true, capture: true });
 
 /* override onCardTap to add chime */
 const _onCardTap = onCardTap;
@@ -1425,12 +1461,15 @@ window.onCardTap = function(sec, event) {
 let lastIndexes = {numbers:-1, vowels:-1, colors:-1, animals:-1, shapes:-1};
 const _navItem = navItem;
 window.navItem = function(sec, dir) {
+  // Asegurar que el contexto esté activo antes de celebrar
+  ensureMusicStarted();
   _navItem(sec, dir);
   const data = getDataFor(sec);
-  if (indexes[sec]===data.length-1 && lastIndexes[sec]!==data.length-1) {
-    setTimeout(()=>playCelebrate(), 280);
+  if (indexes[sec] === data.length - 1 && lastIndexes[sec] !== data.length - 1) {
+    // iOS: no usar setTimeout aquí — llamar directamente
+    playCelebrate();
   }
-  lastIndexes[sec]=indexes[sec];
+  lastIndexes[sec] = indexes[sec];
 };
 
 // init first render
